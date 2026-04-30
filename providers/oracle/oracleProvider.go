@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/StackExchange/dnscontrol/v4/models"
@@ -17,10 +18,10 @@ import (
 	"github.com/StackExchange/dnscontrol/v4/pkg/printer"
 	"github.com/StackExchange/dnscontrol/v4/pkg/providers"
 	"github.com/ThalesGroup/crypto11"
-	"golang.org/x/term"
 	"github.com/oracle/oci-go-sdk/v65/common"
 	"github.com/oracle/oci-go-sdk/v65/dns"
 	"github.com/oracle/oci-go-sdk/v65/example/helpers"
+	"golang.org/x/term"
 )
 
 var features = providers.DocumentationNotes{
@@ -66,22 +67,67 @@ type pkcs11ConfigurationProvider struct {
 	user        string
 	region      string
 	fingerprint string
-	signer      crypto.Signer
+
+	pkcs11Module string
+	tokenLabel   string
+	keyIDHex     string
+	pin          string // from creds.json; empty means prompt
+
+	// signer is initialized lazily on first use via signer.
+	signer func() (crypto.Signer, error)
 }
 
-func (p *pkcs11ConfigurationProvider) TenancyOCID() (string, error)  { return p.tenancy, nil }
-func (p *pkcs11ConfigurationProvider) UserOCID() (string, error)     { return p.user, nil }
-func (p *pkcs11ConfigurationProvider) Region() (string, error)       { return p.region, nil }
-func (p *pkcs11ConfigurationProvider) KeyFingerprint() (string, error) { return p.fingerprint, nil }
+func (p *pkcs11ConfigurationProvider) TenancyOCID() (string, error)     { return p.tenancy, nil }
+func (p *pkcs11ConfigurationProvider) UserOCID() (string, error)        { return p.user, nil }
+func (p *pkcs11ConfigurationProvider) Region() (string, error)          { return p.region, nil }
+func (p *pkcs11ConfigurationProvider) KeyFingerprint() (string, error)  { return p.fingerprint, nil }
 func (p *pkcs11ConfigurationProvider) KeyID() (string, error) {
 	return fmt.Sprintf("%s/%s/%s", p.tenancy, p.user, p.fingerprint), nil
 }
-func (p *pkcs11ConfigurationProvider) PrivateRSAKey() (crypto.Signer, error) { return p.signer, nil }
 func (p *pkcs11ConfigurationProvider) AuthType() (common.AuthConfig, error) {
 	return common.AuthConfig{}, nil
 }
 
-func getPIN() (string, error) {
+func (p *pkcs11ConfigurationProvider) PrivateRSAKey() (crypto.Signer, error) {
+	return p.signer()
+}
+
+func (p *pkcs11ConfigurationProvider) initPKCS11() (crypto.Signer, error) {
+	pin := p.pin
+	if pin == "" {
+		var err error
+		pin, err = promptPIN()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	p11, err := crypto11.Configure(&crypto11.Config{
+		Path:       p.pkcs11Module,
+		TokenLabel: p.tokenLabel,
+		Pin:        pin,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("opening PKCS#11 token: %w", err)
+	}
+
+	keyID, err := hex.DecodeString(p.keyIDHex)
+	if err != nil {
+		return nil, fmt.Errorf("invalid pkcs11_key_id %q: %w", p.keyIDHex, err)
+	}
+
+	signer, err := p11.FindKeyPair(keyID, nil)
+	if err != nil {
+		return nil, fmt.Errorf("finding key pair: %w", err)
+	}
+	if signer == nil {
+		return nil, fmt.Errorf("no key pair found with id %s", p.keyIDHex)
+	}
+
+	return signer, nil
+}
+
+func promptPIN() (string, error) {
 	fmt.Fprint(os.Stderr, "PKCS#11 PIN: ")
 	pin, err := term.ReadPassword(int(os.Stdin.Fd()))
 	fmt.Fprintln(os.Stderr)
@@ -89,48 +135,6 @@ func getPIN() (string, error) {
 		return "", fmt.Errorf("reading PIN: %w", err)
 	}
 	return string(pin), nil
-}
-
-// newPKCS11ConfigurationProvider opens a PKCS#11 token and finds a key pair
-// by CKA_ID (hex-encoded). Prompts for the token PIN via pinentry.
-func newPKCS11ConfigurationProvider(tenancy, user, region, fingerprint, pkcs11Module, tokenLabel, keyIDHex string) (*pkcs11ConfigurationProvider, error) {
-	pin, err := getPIN()
-	if err != nil {
-		return nil, err
-	}
-
-	p11, err := crypto11.Configure(&crypto11.Config{
-		Path:       pkcs11Module,
-		TokenLabel: tokenLabel,
-		Pin:        pin,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("opening PKCS#11 token: %w", err)
-	}
-
-	keyID, err := hex.DecodeString(keyIDHex)
-	if err != nil {
-		p11.Close()
-		return nil, fmt.Errorf("invalid pkcs11_key_id %q: %w", keyIDHex, err)
-	}
-
-	signer, err := p11.FindKeyPair(keyID, nil)
-	if err != nil {
-		p11.Close()
-		return nil, fmt.Errorf("finding key pair: %w", err)
-	}
-	if signer == nil {
-		p11.Close()
-		return nil, fmt.Errorf("no key pair found with id %s", keyIDHex)
-	}
-
-	return &pkcs11ConfigurationProvider{
-		tenancy:     tenancy,
-		user:        user,
-		region:      region,
-		fingerprint: fingerprint,
-		signer:      signer,
-	}, nil
 }
 
 // New creates a new provider for Oracle Cloud DNS.
@@ -162,19 +166,18 @@ func New(settings map[string]string, _ json.RawMessage) (providers.DNSServicePro
 			return nil, fmt.Errorf("pkcs11_key_id is required when private_key is not set")
 		}
 
-		var err error
-		configProvider, err = newPKCS11ConfigurationProvider(
-			settings["tenancy_ocid"],
-			settings["user_ocid"],
-			settings["region"],
-			settings["fingerprint"],
-			pkcs11Module,
-			tokenLabel,
-			keyID,
-		)
-		if err != nil {
-			return nil, fmt.Errorf("PKCS#11 setup: %w", err)
+		p := &pkcs11ConfigurationProvider{
+			tenancy:      settings["tenancy_ocid"],
+			user:         settings["user_ocid"],
+			region:       settings["region"],
+			fingerprint:  settings["fingerprint"],
+			pkcs11Module: pkcs11Module,
+			tokenLabel:   tokenLabel,
+			keyIDHex:     keyID,
+			pin:          settings["pkcs11_pin"],
 		}
+		p.signer = sync.OnceValues(p.initPKCS11)
+		configProvider = p
 	}
 
 	client, err := dns.NewDnsClientWithConfigurationProvider(configProvider)
