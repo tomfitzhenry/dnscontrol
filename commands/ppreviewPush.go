@@ -240,7 +240,7 @@ func prun(args PPreviewArgs, push bool, interactive bool, out printer.CLI, repor
 	}
 
 	out.PrintfIf(fullMode, "Creating an in-memory model of 'desired'...\n")
-	notifier, err := PInitializeProviders(cfg, providerConfigs, notify)
+	notifier, err := PInitializeProviders(cfg, providerConfigs, notify, args.Providers)
 	if err != nil {
 		return err
 	}
@@ -810,7 +810,8 @@ func msg(s string) []*models.Correction {
 }
 
 // PInitializeProviders takes (fully processed) configuration and instantiates all providers and returns them.
-func PInitializeProviders(cfg *models.DNSConfig, providerConfigs map[string]map[string]string, notifyFlag bool) (notify notifications.Notifier, err error) {
+// providerFilter is the value of the --providers flag (empty string means default providers only).
+func PInitializeProviders(cfg *models.DNSConfig, providerConfigs map[string]map[string]string, notifyFlag bool, providerFilter string) (notify notifications.Notifier, err error) {
 	var notificationCfg map[string]string
 	defer func() {
 		notify = notifications.Init(notificationCfg)
@@ -851,6 +852,10 @@ func PInitializeProviders(cfg *models.DNSConfig, providerConfigs map[string]map[
 		d.RegistrarInstance.IsDefault = !isNonDefault[d.RegistrarName]
 		for _, pInst := range d.DNSProviderInstances {
 			if dnsProviders[pInst.Name] == nil {
+				pInst.IsDefault = !isNonDefault[pInst.Name]
+				if !shouldInitializeProvider(pInst, providerFilter) {
+					continue
+				}
 				dCfg := cfg.DNSProvidersByName[pInst.Name]
 				prov, err := providers.CreateDNSProvider(dCfg.Type, providerConfigs[dCfg.Name], dCfg.Metadata)
 				if err != nil {
@@ -863,6 +868,25 @@ func PInitializeProviders(cfg *models.DNSConfig, providerConfigs map[string]map[
 		}
 	}
 	return notify, err
+}
+
+// shouldInitializeProvider reports whether a provider instance should be
+// initialized, based on the --providers filter. This mirrors the logic in
+// whichProvidersToProcess so that we avoid eagerly initializing providers
+// that won't be used (e.g. PKCS#11-backed providers that require hardware).
+func shouldInitializeProvider(p *models.DNSProviderInstance, filter string) bool {
+	if filter == "all" {
+		return true
+	}
+	if filter == "" {
+		return p.IsDefault
+	}
+	for _, name := range strings.Split(filter, ",") {
+		if p.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // pproviderTypeFieldName is the name of the field in creds.json that specifies the provider type id.
